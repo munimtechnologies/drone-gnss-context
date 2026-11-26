@@ -11,10 +11,13 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gnss_context as gc  # noqa: E402
+import test_ulog_flight as tu  # noqa: E402  (synthetic ULog builders)
+import ulog_flight as uf  # noqa: E402
 
 I = gc.INTERVAL_S
 DAY = gc.DAY_S
@@ -188,6 +191,7 @@ class TestContext(unittest.TestCase):
         self.assertIn("NOAA G4", c["notes"][0])
         self.assertIn("May 2024", c["notes"][0])
         self.assertIn("gpsjam.org/?lat=52.10&lon=5.10&z=6&date=2024-05-10", c["notes"][-1])
+        self.assertNotIn("receiver", c)
 
     def test_storm_in_previous_day_only(self):
         t = utc(2024, 6, 15, 12)
@@ -240,6 +244,72 @@ class TestContext(unittest.TestCase):
         text = gc.render(gc.context(t, 52.1, 5.1, gc.parse_kp_json(SAMPLE), now=t + 3 * DAY))
         self.assertIn("magnetic latitude", text)
         self.assertIn("Kp 9- (G4, def)", text)
+        self.assertNotIn("receiver log", text)
+
+
+class TestReceiver(unittest.TestCase):
+    """Context with a flight log's own GNSS reports (the synthetic log from test_ulog_flight)."""
+
+    def setUp(self):
+        self.s = uf.read_flight(tu.new_log())[0]
+        self.t = tu.T0 + 1                                   # the log's first good fix, 2024-05-10T20:15:01Z
+
+    def test_quiet_sky_with_interference_signs(self):
+        t = self.t
+        c = gc.context(t, 52.1, 5.1, {t // I * I: (1.0, "def")}, now=t + 3 * DAY, receiver=self.s)
+        n = c["notes"]
+        self.assertTrue(n[0].startswith("No space-weather red flag"))
+        self.assertTrue(any("flagged spoofing in 2 of 5 samples" in x and "(1 with multiple" in x for x in n))
+        self.assertTrue(any("1 samples at warning level and 2 at critical level" in x for x in n))
+        self.assertTrue(any("jumped 1 time(s)" in x for x in n))
+        self.assertTrue(any("largest 100.0 s" in x for x in n))
+        self.assertTrue(any("3D fix was lost 1 time(s)" in x for x in n))
+        self.assertTrue(n[-2].startswith("A quiet sky together with"))
+        self.assertIn("gpsjam.org/", n[-1])
+        self.assertEqual(c["receiver"]["topic"], "sensor_gps[0]")
+        self.assertTrue(gc.log_suspicious(self.s))
+
+    def test_storm_means_no_local_verdict(self):
+        t = self.t
+        c = gc.context(t, 52.1, 5.1, gc.parse_kp_json(SAMPLE), now=t + 3 * DAY, receiver=self.s)
+        self.assertIn("NOAA G4", c["notes"][0])
+        self.assertFalse(any(x.startswith("A quiet sky") for x in c["notes"]))
+
+    def test_unknown_kp_means_no_local_verdict(self):
+        c = gc.context(self.t, 52.1, 5.1, None, now=self.t + 3 * DAY, receiver=self.s)
+        self.assertFalse(any(x.startswith("A quiet sky") for x in c["notes"]))
+
+    def test_jamming_warning_alone_is_weak(self):
+        def gps_row(i):
+            v = {"timestamp": 1000000 * (i + 1), "time_utc_usec": tu.U0 + 1000000 * i, "fix_type": 3,
+                 "latitude_deg": 52.1, "longitude_deg": 5.1, "eph": 2.0, "satellites_used": 10,
+                 "spoofing_state": 1, "jamming_state": 2, "jamming_indicator": 30}
+            return tuple(v.get(f) for f in uf.GPS_FIELDS)
+
+        s = uf.summarize([gps_row(i) for i in range(3)])
+        self.assertEqual((s["jamming"]["warning"], s["jamming"]["critical"]), (3, 0))
+        self.assertEqual((s["teleports"], s["utc_jumps"], s["fix_losses"]), (0, 0, 0))
+        self.assertFalse(gc.log_suspicious(s))
+        self.assertFalse(uf.suspicious(s))
+        t = tu.T0
+        c = gc.context(t, 52.1, 5.1, {t // I * I: (1.0, "def")}, now=t + 3 * DAY, receiver=s)
+        self.assertTrue(any("3 samples at warning level and 0 at critical level" in x and "weak evidence" in x
+                            for x in c["notes"]))
+        self.assertFalse(any(x.startswith("A quiet sky") for x in c["notes"]))
+
+    def test_receiver_without_states(self):
+        s = uf.read_flight(tu.old_log())[0]
+        t = utc(2024, 6, 15, 12)
+        c = gc.context(t, -33.6, 151.2, {t // I * I: (1.0, "def")}, now=t + 3 * DAY, receiver=s)
+        self.assertTrue(any(x.startswith("This receiver did not report spoofing or jamming states") for x in c["notes"]))
+        self.assertFalse(any(x.startswith("A quiet sky") for x in c["notes"]))
+        self.assertFalse(gc.log_suspicious(s))
+
+    def test_render_receiver_line(self):
+        t = self.t
+        text = gc.render(gc.context(t, 52.1, 5.1, None, now=t + 3 * DAY, receiver=self.s))
+        self.assertIn("receiver log (sensor_gps[0], 5 GNSS samples): spoofing flagged 2/5, jamming warning 1 "
+                      "critical 2, position jumps 1, clock jumps 1, fix losses 1", text)
 
 
 class TestMain(unittest.TestCase):
@@ -265,6 +335,40 @@ class TestMain(unittest.TestCase):
     def test_bad_input(self):
         self.assertEqual(self.run_main(["--time", "2024-06-15T12:00Z", "--lat", "95", "--lon", "5", "--offline"])[0], 2)
         self.assertEqual(self.run_main(["--time", "not-a-time", "--lat", "45", "--lon", "5", "--offline"])[0], 2)
+        self.assertEqual(self.run_main(["--lat", "45", "--lon", "5", "--offline"])[0], 2)      # no time
+
+    def write(self, folder, name, data):
+        path = os.path.join(folder, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_ulog(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self.write(d, "flight.ulg", tu.new_log())
+            code, out = self.run_main(["--ulog", path, "--offline", "--json"])
+        self.assertEqual(code, 0)
+        c = json.loads(out)
+        self.assertEqual(c["time_utc"], "2024-05-10T20:15:01Z")
+        self.assertEqual((c["lat"], c["lon"]), (52.1, 5.1))
+        self.assertEqual(c["receiver"]["spoofing"]["indicated"], 2)
+        self.assertEqual(c["receiver"]["first_fix"]["quality"], "good")
+
+    def test_ulog_without_utc_needs_time(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self.write(d, "old.ulg", tu.old_log())
+            self.assertEqual(self.run_main(["--ulog", path, "--offline"])[0], 2)
+            code, out = self.run_main(["--ulog", path, "--time", "2024-06-15T12:00Z", "--offline", "--json"])
+        self.assertEqual(code, 0)
+        c = json.loads(out)
+        self.assertAlmostEqual(c["lat"], -33.6, places=6)
+        self.assertEqual(c["time_utc"], "2024-06-15T12:00:00Z")
+
+    def test_ulog_bad_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self.write(d, "notes.txt", b"hello world 12345678")
+            self.assertEqual(self.run_main(["--ulog", path, "--offline"])[0], 2)
+            self.assertEqual(self.run_main(["--ulog", os.path.join(d, "missing.ulg"), "--offline"])[0], 2)
 
 
 if __name__ == "__main__":

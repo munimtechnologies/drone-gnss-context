@@ -1,7 +1,7 @@
 """drone-gnss-context: space-weather and interference context for one drone flight's GNSS.
 
-Give it when (UTC) and where a flight happened. It answers the first questions an operator asks after a
-GNSS problem ("was it the sky, or was it something here?"):
+Give it when (UTC) and where a flight happened, or a PX4 flight log (.ulg). It answers the first questions an
+operator asks after a GNSS problem ("was it the sky, or was it something here?"):
 
 - the planetary geomagnetic index Kp for that 3-hour interval and the 24 hours before it, from GFZ Potsdam's
   public Kp web service (CC BY 4.0, Matzka et al. 2021), with the NOAA storm level (G0 to G5);
@@ -9,7 +9,10 @@ GNSS problem ("was it the sky, or was it something here?"):
 - local solar time and whether the flight was in the post-sunset window when equatorial plasma bubbles form;
 - whether the month is an equinox season (when plasma bubbles are most frequent in most longitude sectors);
 - a link to the GPSJam map of that UTC day around the place (aircraft-reported navigation accuracy, often a sign
-  of jamming). Only the link is given; no GPSJam data is copied.
+  of jamming). Only the link is given; no GPSJam data is copied;
+- with --ulog (needs ulog_flight.py next to this file): time and place from the log's first good GNSS fix, and
+  what the receiver itself reported during the flight (spoofing and jamming states, position jumps no drone can
+  fly, receiver clock jumps, fix losses). The log is read locally; only the time window goes to GFZ.
 
 It is information, not a safety verdict: a quiet sky does not prove a local cause, and a storm does not prove the
 storm caused a given problem.
@@ -18,6 +21,7 @@ Standard library only. Usage:
 
     python gnss_context.py --time 2024-05-10T20:15Z --lat 52.1 --lon 5.1
     python gnss_context.py --time 2024-05-10T20:15Z --lat 52.1 --lon 5.1 --json
+    python gnss_context.py --ulog flight.ulg
 
 By MV2 of Munim, Inc. (mv2@munimtech.com); made with AI agents. Apache-2.0.
 """
@@ -34,7 +38,7 @@ import time
 import urllib.parse
 import urllib.request
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 INTERVAL_S = 10800                      # Kp is given for 3-hour UTC intervals starting 00, 03, ..., 21 UT
 DAY_S = 86400
@@ -186,6 +190,49 @@ def gpsjam_link(t, lat, lon, now=None):
     return "https://gpsjam.org/?lat=%.2f&lon=%.2f&z=6&date=%s" % (lat, lon, day)
 
 
+# ---------------------------------------------------------------- the receiver's own reports (from --ulog)
+
+def log_suspicious(r):
+    """True when a log summary (from ulog_flight.summarize) shows signs of interference: spoofing flagged by the
+    receiver, jamming at critical level, position jumps no drone can fly, or receiver clock jumps. A jamming
+    warning alone does not count: it shows up in most public PX4 logs that report a jamming state."""
+    return bool(r["spoofing"]["indicated"] or r["jamming"]["critical"] or r["teleports"] or r["utc_jumps"])
+
+
+def receiver_notes(r):
+    """Plain-language notes on what the flight log's GNSS receiver reported."""
+    out = []
+    sp, jm = r["spoofing"], r["jamming"]
+    if sp["indicated"]:
+        out.append("The receiver itself flagged spoofing in %d of %d samples that reported a spoofing state%s."
+                   % (sp["indicated"], sp["reporting"],
+                      " (%d with multiple spoofing indications)" % sp["multiple"] if sp["multiple"] else ""))
+    if jm["warning"] or jm["critical"]:
+        text = ("The receiver reported jamming: %d samples at warning level and %d at critical level."
+                % (jm["warning"], jm["critical"]))
+        if not jm["critical"]:
+            text += (" Warning level alone (interference seen, fix kept) is common: it showed up in 70% of the "
+                     "public PX4 logs that report a jamming state in MV2's px4-log-health fleet study, so on its "
+                     "own it is weak evidence.")
+        out.append(text)
+    if r["teleports"]:
+        out.append("The position jumped %d time(s) faster than any drone flies (largest jump %.1f km), a typical "
+                   "sign of spoofing or of a receiver fault." % (r["teleports"], r["max_jump_km"]))
+    if r["utc_jumps"]:
+        out.append("The receiver's clock jumped against the flight controller's clock %d time(s) (largest %.1f s), "
+                   "another sign of spoofing." % (r["utc_jumps"], r["max_utc_jump_s"]))
+    if r["fix_losses"]:
+        out.append("The 3D fix was lost %d time(s) during the log." % r["fix_losses"])
+    if not out:
+        if sp["reporting"] or jm["reporting"]:
+            out.append("The receiver reported no spoofing or jamming, and the log shows no position jumps, clock "
+                       "jumps or fix losses (%d GNSS samples)." % r["n_gps"])
+        else:
+            out.append("This receiver did not report spoofing or jamming states (older PX4 or receiver driver); the "
+                       "log shows no position jumps, clock jumps or fix losses (%d GNSS samples)." % r["n_gps"])
+    return out
+
+
 # ---------------------------------------------------------------- context
 
 def notes(c):
@@ -222,15 +269,22 @@ def notes(c):
         out.append("No space-weather red flag for this time and place. If GNSS was degraded, look at local "
                    "causes first: jamming or spoofing, obstructions and multipath, antenna placement, and "
                    "interference from the drone's own electronics.")
+    r = c.get("receiver")
+    if r is not None:
+        out += receiver_notes(r)
+        quiet = k["kp"] is not None and k["g_scale"] == 0 and (k["g_scale_max_24h"] or 0) == 0
+        if quiet and log_suspicious(r):
+            out.append("A quiet sky together with the receiver's own interference signs points to a local or "
+                       "regional source (jamming or spoofing) rather than space weather.")
     if c["gpsjam"]:
         out.append("Aircraft over this area that day (GPSJam; red or yellow hexes mean many aircraft reported "
                    "degraded navigation, which often means jamming): " + c["gpsjam"])
     return out
 
 
-def context(t, lat, lon, series=None, now=None):
+def context(t, lat, lon, series=None, now=None, receiver=None):
     """Everything above for one flight: t in UTC epoch seconds, lat/lon in degrees. series is a Kp series as from
-    fetch_kp (None: Kp unknown)."""
+    fetch_kp (None: Kp unknown). receiver is a log summary from ulog_flight (None: no log given)."""
     if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
         raise ValueError("latitude must be -90..90 and longitude -180..180")
     ml = mag_lat(lat, lon)
@@ -240,6 +294,8 @@ def context(t, lat, lon, series=None, now=None):
          "local_solar_time": "%02d:%02d" % divmod(int(round(lst * 60)) % 1440, 60),
          "local_solar_hour": round(lst, 3), "time_class": time_class(lst), "equinox_season": equinox_season(t),
          "kp": kp_context(series, t), "gpsjam": gpsjam_link(t, lat, lon, now)}
+    if receiver is not None:
+        c["receiver"] = receiver
     c["notes"] = notes(c)
     c["sources"] = ["Kp: GFZ Potsdam, CC BY 4.0 (Matzka et al. 2021, doi:10.1029/2020SW002641)",
                     "GPSJam: gpsjam.org (link only)"]
@@ -254,24 +310,58 @@ def render(c):
                 "; equinox season" if c["equinox_season"] else ""),
              "  Kp %s (G%s, %s) in the interval from %s; max Kp in 24 h: %s"
              % (k["kp_label"] or "unknown", "?" if k["g_scale"] is None else k["g_scale"], k["kp_status"] or "-",
-                k["interval_start"], k["max_kp_24h_label"] or "unknown"),
-             ""]
+                k["interval_start"], k["max_kp_24h_label"] or "unknown")]
+    r = c.get("receiver")
+    if r is not None:
+        lines.append("  receiver log (%s, %d GNSS samples): spoofing flagged %d/%d, jamming warning %d critical %d, "
+                     "position jumps %d, clock jumps %d, fix losses %d"
+                     % (r.get("topic", "?"), r["n_gps"], r["spoofing"]["indicated"], r["spoofing"]["reporting"],
+                        r["jamming"]["warning"], r["jamming"]["critical"], r["teleports"], r["utc_jumps"],
+                        r["fix_losses"]))
+    lines.append("")
     lines += ["- " + n for n in c["notes"]]
     return "\n".join(lines)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Space-weather and interference context for a drone flight's GNSS.")
-    ap.add_argument("--time", required=True, help="flight time, ISO 8601 (no offset = UTC) or epoch seconds")
-    ap.add_argument("--lat", required=True, type=float, help="latitude, degrees")
-    ap.add_argument("--lon", required=True, type=float, help="longitude, degrees")
+    ap.add_argument("--time", help="flight time, ISO 8601 (no offset = UTC) or epoch seconds")
+    ap.add_argument("--lat", type=float, help="latitude, degrees")
+    ap.add_argument("--lon", type=float, help="longitude, degrees")
+    ap.add_argument("--ulog", help="a PX4 flight log (.ulg): time and place come from its first good GNSS fix "
+                                   "(unless given), and the receiver's own reports are summarised")
     ap.add_argument("--json", action="store_true", help="print JSON instead of text")
     ap.add_argument("--offline", action="store_true", help="do not fetch Kp from GFZ")
     a = ap.parse_args(argv)
-    try:
-        t = parse_time(a.time)
-    except ValueError:
-        print("could not read --time %r" % a.time, file=sys.stderr)
+    t = lat = lon = receiver = None
+    if a.ulog:
+        try:
+            import ulog_flight
+        except ImportError:
+            print("--ulog needs ulog_flight.py next to gnss_context.py", file=sys.stderr)
+            return 2
+        try:
+            receiver, _info = ulog_flight.read_file(a.ulog)
+        except Exception as error:  # noqa: BLE001 - any unreadable file is a usage error here
+            print("could not read %s: %s" % (a.ulog, error), file=sys.stderr)
+            return 2
+        first = receiver.get("first_fix") if receiver else None
+        if first:
+            t, lat, lon = first["time_utc"], first["lat"], first["lon"]
+    if a.time is not None:
+        try:
+            t = parse_time(a.time)
+        except ValueError:
+            print("could not read --time %r" % a.time, file=sys.stderr)
+            return 2
+    if a.lat is not None:
+        lat = a.lat
+    if a.lon is not None:
+        lon = a.lon
+    missing = [n for n, v in (("--time", t), ("--lat", lat), ("--lon", lon)) if v is None]
+    if missing:
+        why = " (the log has no GNSS fix with a UTC time and position)" if a.ulog else ""
+        print("missing %s%s" % (", ".join(missing), why), file=sys.stderr)
         return 2
     series = None
     if not a.offline:
@@ -280,7 +370,7 @@ def main(argv=None):
         except (OSError, ValueError) as error:
             print("Kp fetch failed: %s" % error, file=sys.stderr)
     try:
-        c = context(t, a.lat, a.lon, series)
+        c = context(t, lat, lon, series, receiver=receiver)
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
